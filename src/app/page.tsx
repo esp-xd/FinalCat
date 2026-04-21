@@ -1,226 +1,277 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { AIChatInput } from "@/components/ui/ai-chat-input";
-import { ChatStream } from "@/components/chat-stream";
-import { Settings, Trash2, LayoutDashboard, Moon, Sun, Loader2 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import Image from "next/image";
+import { ChangeEvent, useMemo, useState } from "react";
 
-interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  type?: "text" | "image" | "audio";
-  mediaUrl?: string;
+type JudgeResult = {
+  time_score: number;
+  neatness_score: number;
+  placement_score: number;
+  working_score: number;
+  total_score: number;
+  comments: string;
+};
+
+type ImageSlot = 1 | 2;
+
+const MAX_IMAGE_BYTES = 7 * 1024 * 1024;
+
+async function fileToOptimizedDataUrl(file: File): Promise<string> {
+  const loadImage =
+    typeof window !== "undefined" && "createImageBitmap" in window
+      ? await createImageBitmap(file)
+      : await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = URL.createObjectURL(file);
+        });
+
+  const width = "width" in loadImage ? loadImage.width : (loadImage as HTMLImageElement).naturalWidth;
+  const height = "height" in loadImage ? loadImage.height : (loadImage as HTMLImageElement).naturalHeight;
+
+  const maxDim = 2400;
+  const scale = Math.min(1, maxDim / Math.max(width, height));
+  const targetWidth = Math.max(1, Math.round(width * scale));
+  const targetHeight = Math.max(1, Math.round(height * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Unable to process image.");
+  ctx.drawImage(loadImage as CanvasImageSource, 0, 0, targetWidth, targetHeight);
+
+  if (!("close" in loadImage)) {
+    URL.revokeObjectURL((loadImage as HTMLImageElement).src);
+  }
+
+  const attempt = (quality: number) => canvas.toDataURL("image/jpeg", quality);
+  let quality = 0.92;
+  let dataUrl = attempt(quality);
+  while (dataUrl.length * 0.75 > MAX_IMAGE_BYTES && quality > 0.45) {
+    quality -= 0.08;
+    dataUrl = attempt(quality);
+  }
+
+  return dataUrl;
 }
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([
-    { id: "1", role: "assistant", content: "Hello! How can I help you today?" }
-  ]);
-  const [isTyping, setIsTyping] = useState(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const mediaRecorder = useRef<MediaRecorder | null>(null);
-  const audioChunks = useRef<Blob[]>([]);
+  const [minutes, setMinutes] = useState("12");
+  const [seconds, setSeconds] = useState("34");
+  const [isWorking, setIsWorking] = useState(true);
 
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  const [image1File, setImage1File] = useState<File | null>(null);
+  const [image2File, setImage2File] = useState<File | null>(null);
+
+  const [result, setResult] = useState<JudgeResult | null>(null);
+  const [error, setError] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  const canSubmit = useMemo(
+    () => !!image1File && !!image2File && minutes.trim() !== "" && seconds.trim() !== "",
+    [image1File, image2File, minutes, seconds],
+  );
+
+  const handleFileChange = (slot: ImageSlot, e: ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0] ?? null;
+    if (slot === 1) setImage1File(selected);
+    if (slot === 2) setImage2File(selected);
+  };
+
+  const validateInputs = () => {
+    const mins = Number.parseInt(minutes, 10);
+    const secs = Number.parseInt(seconds, 10);
+
+    if (Number.isNaN(mins) || mins < 0 || mins > 999) return "Minutes must be between 0 and 999.";
+    if (Number.isNaN(secs) || secs < 0 || secs > 59) return "Seconds must be between 0 and 59.";
+    if (!image1File || !image2File) return "Please upload both images.";
+
+    return null;
+  };
+
+  const handleJudge = async () => {
+    const validationError = validateInputs();
+    if (validationError) {
+      setError(validationError);
+      return;
     }
-  }, [messages, isTyping]);
 
-  const handleSend = async (content: string, mediaData?: { type: "image", url: string }) => {
-    const userMsg: Message = { 
-      id: Date.now().toString(), 
-      role: "user", 
-      content,
-      type: mediaData?.type,
-      mediaUrl: mediaData?.url
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setIsTyping(true);
+    setError("");
+    setResult(null);
+    setIsLoading(true);
 
     try {
-      const isImageGen = content.toLowerCase().includes("/gen");
-      const model = isImageGen ? "retro-diffusion/rd-plus" : (mediaData ? "google/gemini-3-flash-preview" : "qwen/qwen3-32b");
-      
-      let payloadMessages: any[] = [];
-      if (mediaData && mediaData.type === "image") {
-        payloadMessages = [{
-          role: "user",
-          content: [
-            { type: "text", text: content || "Analyze this image" },
-            { type: "image_url", image_url: { url: mediaData.url } }
-          ]
-        }];
-      } else {
-        payloadMessages = messages.concat(userMsg).map(m => ({ role: m.role, content: m.content }));
-      }
+      const [image1DataUrl, image2DataUrl] = await Promise.all([
+        fileToOptimizedDataUrl(image1File as File),
+        fileToOptimizedDataUrl(image2File as File),
+      ]);
 
-      const response = await fetch("/api/chat", {
+      const response = await fetch("/api/judge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: payloadMessages, model })
+        body: JSON.stringify({
+          minutes: Number.parseInt(minutes, 10),
+          seconds: Number.parseInt(seconds, 10),
+          working: isWorking,
+          images: [image1DataUrl, image2DataUrl],
+        }),
       });
 
-      if (!response.body) return;
-
-      const aiMsgId = (Date.now() + 1).toString();
-      setMessages(prev => [...prev, { id: aiMsgId, role: "assistant", content: "" }]);
-      setIsTyping(false);
-
-      const reader = response.body.getReader();
-      const decoder = new TextEncoder();
-      let fullContent = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        const chunk = new TextDecoder().decode(value);
-        fullContent += chunk;
-        
-        setMessages(prev => prev.map(m => 
-          m.id === aiMsgId ? { ...m, content: fullContent } : m
-        ));
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Judging failed.");
       }
 
-      // Auto-play audio response if text and not image gen
-      if (!isImageGen) {
-        playAudio(fullContent);
-      }
-    } catch (error) {
-      console.error("Chat Error:", error);
+      setResult(data.result as JudgeResult);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unexpected error.";
+      setError(message);
     } finally {
-      setIsTyping(false);
-    }
-  };
-
-  const playAudio = async (text: string) => {
-    try {
-      const response = await fetch("/api/audio/speech", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text })
-      });
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audio.play();
-      }
-    } catch (e) {}
-  };
-
-  const handleImageUpload = async (file: File) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      handleSend("", { type: "image", url: reader.result as string });
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const toggleRecording = async () => {
-    if (isRecording) {
-      mediaRecorder.current?.stop();
-      setIsRecording(false);
-    } else {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder.current = new MediaRecorder(stream);
-        audioChunks.current = [];
-        
-        mediaRecorder.current.ondataavailable = (e) => audioChunks.current.push(e.data);
-        mediaRecorder.current.onstop = async () => {
-          const audioBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
-          const formData = new FormData();
-          formData.append('file', audioBlob, 'audio.webm');
-          
-          const response = await fetch('/api/audio/transcriptions', {
-            method: 'POST',
-            body: formData
-          });
-          const data = await response.json();
-          if (data.text) {
-            handleSend(data.text);
-          }
-        };
-        
-        mediaRecorder.current.start();
-        setIsRecording(true);
-      } catch (err) {
-        console.error("Mic access denied:", err);
-      }
+      setIsLoading(false);
     }
   };
 
   return (
-    <div className="flex h-screen bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans antialiased overflow-hidden">
-      <AnimatePresence>
-        {isSidebarOpen && (
-          <motion.aside
-            initial={{ x: -300 }}
-            animate={{ x: 0 }}
-            exit={{ x: -300 }}
-            className="w-[300px] border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 flex flex-col p-4 z-50"
-          >
-            <div className="flex items-center justify-between mb-8">
-              <h2 className="font-bold text-lg">Assistant</h2>
-              <button onClick={() => setIsSidebarOpen(false)} className="p-2 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-lg">
-                <Settings size={18} />
-              </button>
-            </div>
-            <div className="flex-1 space-y-2 overflow-y-auto">
-              <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">History</div>
-              <button className="w-full text-left p-3 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-800 text-sm truncate">How to build a SaaS...</button>
-              <button className="w-full text-left p-3 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-800 text-sm truncate">Marketing strategy for...</button>
-            </div>
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-1">
-              <button onClick={() => setMessages([{ id: "1", role: "assistant", content: "Chat cleared." }])} className="w-full flex items-center gap-3 p-3 text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 rounded-xl transition-colors">
-                <Trash2 size={16} />
-                Clear Chat
-              </button>
-              <a href="#" className="w-full flex items-center gap-3 p-3 text-sm hover:bg-slate-200 dark:hover:bg-slate-800 rounded-xl transition-colors">
-                <LayoutDashboard size={16} />
-                GitHub Repository
-              </a>
-            </div>
-          </motion.aside>
-        )}
-      </AnimatePresence>
+    <main className="min-h-screen bg-[#0a1a2f] px-6 py-8 text-[#FFE484] relative overflow-x-hidden">
+      <div className="pointer-events-none fixed inset-0 z-0 [background-image:linear-gradient(to_right,rgba(255,255,255,0.18)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.18)_1px,transparent_1px)] [background-size:48px_48px]" />
 
-      <main className="flex-1 flex flex-col relative min-w-0">
-        <header className="h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white/80 dark:bg-slate-950/80 backdrop-blur-sm z-40 sticky top-0">
-          <div className="flex items-center gap-4">
-            {!isSidebarOpen && (
-              <button onClick={() => setIsSidebarOpen(true)} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-900 rounded-lg">
-                <Settings size={18} />
-              </button>
-            )}
-            <h1 className="font-semibold text-sm">New Conversation</h1>
-          </div>
-          <div className="flex items-center gap-2">
-            {isRecording && <div className="flex items-center gap-2 text-xs text-red-500 animate-pulse font-medium"><div className="w-2 h-2 rounded-full bg-red-500" /> Recording...</div>}
-          </div>
+      <a href="https://hackclub.com/" target="_blank" rel="noreferrer" className="absolute left-2 top-0 z-20">
+        <Image className="w-56" src="https://assets.hackclub.com/banners/2026.svg" alt="Hack Club" width={256} height={102} unoptimized />
+      </a>
+
+      <div className="relative z-10 mx-auto max-w-6xl pt-20">
+        <header className="mb-10">
+          <h1 className="inline-block border-b border-[#ffe57066] pb-1 text-5xl font-bold text-[#FFE570] [text-shadow:0_0_20px_rgba(255,215,0,0.55)]">
+            ⚡ THE FINAL CAT !
+          </h1>
+          <p className="mt-2 text-lg text-[#FFDF8C]">AI JUDGE • 16–18 y/o • DIY SOLDERED PROJECTS</p>
         </header>
 
-        <div ref={scrollRef} className="flex-1 overflow-y-auto">
-          <ChatStream messages={messages} isTyping={isTyping} />
-        </div>
+        <section className="rounded-3xl border border-[#FFD96666] bg-[#051428b3] p-8 shadow-2xl">
+          <div className="grid gap-8 md:grid-cols-[1.1fr_0.9fr]">
+            <div>
+              <label className="mb-2 block text-sm font-semibold uppercase tracking-[0.2em] text-[#FFD966]">
+                ⏱️ Time of completion
+              </label>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center rounded-3xl border border-[#FFD966] bg-[#0a1f35] px-3 py-1">
+                  <input
+                    type="number"
+                    min={0}
+                    max={999}
+                    value={minutes}
+                    onChange={(e) => setMinutes(e.target.value)}
+                    className="w-20 bg-transparent text-center text-2xl font-bold outline-none"
+                  />
+                  <span className="px-1 text-2xl text-[#FFD966]">:</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={seconds}
+                    onChange={(e) => setSeconds(e.target.value)}
+                    className="w-20 bg-transparent text-center text-2xl font-bold outline-none"
+                  />
+                </div>
+                <span className="text-sm text-[#FFD58C]">(minutes : seconds)</span>
+              </div>
 
-        <div className="p-4 md:p-6 bg-gradient-to-t from-white dark:from-slate-950 via-white dark:via-slate-950 to-transparent">
-          <AIChatInput 
-            onSend={handleSend} 
-            onImageUpload={handleImageUpload}
-            onVoiceStart={toggleRecording}
-          />
-          <p className="text-[10px] text-slate-400 text-center mt-3">
-            AI can make mistakes. Consider checking important information.
-          </p>
-        </div>
-      </main>
-    </div>
+              <label className="mb-2 mt-8 block text-sm font-semibold uppercase tracking-[0.2em] text-[#FFD966]">
+                📸 Two images (PCB + solder joints)
+              </label>
+              <div className="space-y-3">
+                {[1, 2].map((slot) => {
+                  const file = slot === 1 ? image1File : image2File;
+                  return (
+                    <div key={slot} className="rounded-2xl border border-dashed border-[#FFD966] bg-[#0c1f33] p-4">
+                      <label className="flex cursor-pointer items-center gap-3">
+                        <span className="rounded-full border border-[#FFD966] bg-[#1e3f60] px-4 py-1 font-bold">📷 IMAGE {slot}</span>
+                        <span className="max-w-[220px] truncate text-sm text-[#FFEAB3]">{file?.name ?? "No file chosen"}</span>
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          onChange={(e) => handleFileChange(slot as ImageSlot, e)}
+                          className="hidden"
+                        />
+                      </label>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="mt-2 text-sm text-[#FFD58C]">✨ Large images supported (auto-optimized before sending)</p>
+
+              <label className="mt-8 flex items-center gap-3 rounded-full border border-[#FFD966] bg-[#0b2442] px-5 py-3 text-xl">
+                <input
+                  type="checkbox"
+                  checked={isWorking}
+                  onChange={(e) => setIsWorking(e.target.checked)}
+                  className="h-6 w-6 accent-amber-400"
+                />
+                ✅ PROJECT IS FULLY WORKING (as reported)
+              </label>
+            </div>
+
+            <div className="flex flex-col">
+              <button
+                onClick={handleJudge}
+                disabled={!canSubmit || isLoading}
+                className="w-full rounded-full border-2 border-[#FFD966] bg-gradient-to-br from-[#1e4f7a] to-[#0a2a44] px-6 py-4 text-2xl font-extrabold text-[#FFE484] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                ⚖️ {isLoading ? "JUDGING..." : "JUDGE MY PROJECT"}
+              </button>
+
+              <div className="mt-6 flex-1">
+                <div className="mb-4 text-2xl font-bold text-[#FFD966]">📋 VERDICT</div>
+                <div className="min-h-[260px] rounded-3xl border border-[#FFD966] bg-[#071524e0] p-6">
+                  {isLoading && <div className="text-[#FFD966]">AI is inspecting your work...</div>}
+
+                  {!isLoading && !result && !error && (
+                    <div className="py-8 text-center text-[#FFEAB3]">
+                      <span className="mb-2 block text-6xl">🐾</span>
+                      Upload images & press JUDGE
+                    </div>
+                  )}
+
+                  {!isLoading && error && <div className="rounded-2xl border border-red-400 bg-red-950/40 p-4 text-red-200">⚠️ {error}</div>}
+
+                  {!isLoading && result && (
+                    <>
+                      <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+                        <div className="flex justify-between border-b border-dashed border-[#FFD966] pb-2">
+                          <span>⏱️ Time</span>
+                          <span className="text-2xl font-extrabold">{result.time_score}/10</span>
+                        </div>
+                        <div className="flex justify-between border-b border-dashed border-[#FFD966] pb-2">
+                          <span>🔧 Neatness & joints</span>
+                          <span className="text-2xl font-extrabold">{result.neatness_score}/10</span>
+                        </div>
+                        <div className="flex justify-between border-b border-dashed border-[#FFD966] pb-2">
+                          <span>📐 Placement</span>
+                          <span className="text-2xl font-extrabold">{result.placement_score}/10</span>
+                        </div>
+                        <div className="flex justify-between border-b border-dashed border-[#FFD966] pb-2">
+                          <span>⚡ Functionality</span>
+                          <span className="text-2xl font-extrabold">{result.working_score}/10</span>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 text-right text-4xl font-black text-[#FFE570]">TOTAL: {result.total_score} / 40</div>
+                      <div className="mt-4 rounded-2xl border-l-4 border-[#FFC857] bg-[#0a1e34] p-4">💬 {result.comments}</div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <p className="mt-6 text-center text-sm text-[#FFEEC2]">
+          ⚡ The Final Cat! · fair judging · 4 categories: time, neatness, placement, functionality
+        </p>
+      </div>
+    </main>
   );
 }
